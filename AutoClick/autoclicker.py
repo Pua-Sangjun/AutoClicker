@@ -6,7 +6,7 @@ AutoClicker for macOS
 """
 
 import tkinter as tk
-from tkinter import messagebox, simpledialog
+from tkinter import messagebox, simpledialog, filedialog
 import pyautogui
 import threading
 import queue
@@ -42,6 +42,16 @@ def click_worker():
             pyautogui.click(action["x"], action["y"])
         elif action["type"] == "type":
             pyautogui.typewrite(action["text"], interval=0.05)
+        elif action["type"] == "image":
+            try:
+                loc = pyautogui.locateOnScreen(
+                    action["image_path"], confidence=action.get("confidence", 0.8)
+                )
+                if loc:
+                    center = pyautogui.center(loc)
+                    pyautogui.click(center.x // 2, center.y // 2)
+            except Exception:
+                pass
         click_queue.task_done()
 
 
@@ -60,11 +70,17 @@ class Action:
         return {"type": "type", "text": text}
 
     @staticmethod
+    def image_click(image_path, confidence=0.8):
+        return {"type": "image", "image_path": image_path, "confidence": confidence}
+
+    @staticmethod
     def display(action):
         if action["type"] == "click":
             return f"  [클릭]  ({int(action['x'])}, {int(action['y'])})"
         elif action["type"] == "type":
             return f"  [입력]  {action['text']}"
+        elif action["type"] == "image":
+            return f"  [이미지]  {os.path.basename(action['image_path'])}"
         return ""
 
 
@@ -123,15 +139,26 @@ class AutoClickerApp:
         self.root.attributes("-topmost", False)
 
         self.automations = []
+
         self.sel_idx = None
+
         self.is_recording = False
+
         self.solo_running = False
         self.seq_running = False
+
         self.check_vars = {}
+
         self.is_paused = False
         self.in_loop_wait = False
+
+        self.solo_in_cycle = False
+
         self.pause_event = threading.Event()
         self.pause_event.set()
+
+        self.solo_done_event = threading.Event()
+        self.solo_done_event.set()
 
         self.load_config()
         self.build_ui()
@@ -441,7 +468,7 @@ class AutoClickerApp:
         # 액션 목록
         lf = tk.LabelFrame(
             self.detail_frame,
-            text="  액션 목록 (클릭 + 키보드 입력)  ",
+            text="  액션 목록 (클릭 + 키보드 + 이미지)  ",
             font=("Helvetica Neue", 10),
             bg=BG,
             fg=FG2,
@@ -521,6 +548,23 @@ class AutoClickerApp:
             pady=3,
             cursor="hand2",
         ).pack(side="right")
+
+        img_row = tk.Frame(lf, bg=BG)
+        img_row.pack(fill="x", padx=4, pady=(0, 4))
+        tk.Button(
+            img_row,
+            text="🖼 이미지 추가",
+            command=self.add_image_action,
+            font=("Helvetica Neue", 10),
+            bg="#555",
+            activebackground="#777",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            padx=6,
+            pady=3,
+            cursor="hand2",
+        ).pack(fill="x")
 
         # 타이밍 설정
         sf = tk.LabelFrame(
@@ -620,6 +664,23 @@ class AutoClickerApp:
         self.refresh_actions(a)
         self.save_config()
 
+    def add_image_action(self):
+
+        a = self.current_auto()
+        if not a:
+            return
+        path = filedialog.askopenfilename(
+            title="이미지 파일 선택",
+            filetypes=[("이미지", "*.png *.jpg *.jpeg")],
+            initialdir=os.path.expanduser("~/AutoClicker/AutoClick"),
+            parent=self.root,
+        )
+        if not path:
+            return
+        a.actions.append(Action.image_click(path))
+        self.refresh_actions(a)
+        self.save_config()
+
     def move_up(self):
         a = self.current_auto()
         if not a:
@@ -700,9 +761,6 @@ class AutoClickerApp:
             )
 
     def toggle_recording(self):
-        if self.solo_running or self.seq_running:
-            messagebox.showwarning("알림", "실행 중에는 녹화할 수 없어요.")
-            return
         if not self.is_recording:
             self.is_recording = True
             self.record_btn.config(
@@ -796,12 +854,58 @@ class AutoClickerApp:
             self.solo_status.set("")
 
     def _solo_loop(self, auto):
-        self._run_one(
-            auto,
-            stop_check=lambda: not self.solo_running,
-            status_fn=self.solo_status.set,
-        )
+        self.solo_done_event.clear()
+
+        def solo_stop_check():
+            return not self.solo_running
+
+        interval = auto.interval_ms / 1000.0
+        repeat = auto.repeat_count
+        cycle_d = auto.cycle_delay_ms / 1000.0
+        loop_d = auto.loop_delay_ms / 1000.0
+
+        while not solo_stop_check():
+            for cycle in range(1, (repeat if repeat > 0 else 999999) + 1):
+                if solo_stop_check():
+                    break
+                self.solo_in_cycle = True  # 사이클 시작
+                for i, action in enumerate(auto.actions):
+                    if solo_stop_check():
+                        break
+                    click_queue.put(action)
+                    if i < len(auto.actions) - 1:
+                        time.sleep(interval)
+                if solo_stop_check():
+                    break
+                if not (repeat > 0 and cycle >= repeat) and cycle_d > 0:
+                    self._wait(cycle_d, solo_stop_check)
+            if solo_stop_check():
+                break
+            self.solo_in_cycle = False  # 루프 대기 시작
+            if repeat > 0:
+                if loop_d > 0:
+                    self._set_loop_wait(True)
+                    self._wait_label(
+                        loop_d,
+                        f"⏳  [{auto.name}]  루프 대기",
+                        solo_stop_check,
+                        self.solo_status.set,
+                    )
+                    self._set_loop_wait(False)
+
+            if loop_d > 0:
+                self._set_loop_wait(True)
+                self._wait_label(
+                    loop_d,
+                    f"⏳  [{auto.name}]  다음 루프",
+                    solo_stop_check,
+                    self.solo_status.set,
+                )
+                self._set_loop_wait(False)
+
+        self.solo_in_cycle = False
         self.solo_running = False
+        self.solo_done_event.set()
         self.root.after(
             0,
             lambda: self.run_btn.config(
@@ -846,6 +950,13 @@ class AutoClickerApp:
     def _seq_loop(self, autos):
         while self.seq_running:
             for idx, auto in enumerate(autos):
+                if not self.seq_running:
+                    break
+                while self.solo_in_cycle and self.seq_running:
+                    self.root.after(
+                        0, self.seq_status.set, "🔵 단독 실행 완료 대기 중..."
+                    )
+                    time.sleep(0.5)
                 if not self.seq_running:
                     break
                 self.root.after(
