@@ -58,9 +58,21 @@ def click_worker():
 threading.Thread(target=click_worker, daemon=True).start()
 
 
-class Action:
-    """클릭 또는 키보드 입력 액션"""
+def ms_to_hms(ms):
+    """ms → (h, m, s)"""
+    s = int(ms // 1000)
+    h = s // 3600
+    m = (s % 3600) // 60
+    s = s % 60
+    return h, m, s
 
+
+def hms_to_ms(h, m, s):
+    """(h, m, s) → ms"""
+    return (h * 3600 + m * 60 + s) * 1000
+
+
+class Action:
     @staticmethod
     def click(x, y):
         return {"type": "click", "x": x, "y": y}
@@ -128,35 +140,95 @@ class Automation:
         )
 
 
+class HMSEntry(tk.Frame):
+    """시:분:초 입력 위젯"""
+
+    def __init__(self, parent, ms_value=0, on_change=None, **kwargs):
+        super().__init__(parent, bg=BG, **kwargs)
+        self._on_change = on_change
+
+        h, m, s = ms_to_hms(ms_value)
+        self._h = tk.StringVar(value=str(h))
+        self._m = tk.StringVar(value=f"{m:02d}")
+        self._s = tk.StringVar(value=f"{s:02d}")
+
+        def make_entry(var, width=3):
+            e = tk.Entry(
+                self,
+                textvariable=var,
+                font=("Menlo", 10),
+                width=width,
+                justify="center",
+                bg=CARD,
+                fg=FG,
+                insertbackground=FG,
+                relief="flat",
+                bd=3,
+            )
+            e.bind("<FocusOut>", self._normalize)
+            e.bind("<Return>", self._normalize)
+            return e
+
+        make_entry(self._h, 3).pack(side="left")
+        tk.Label(self, text=":", bg=BG, fg=FG2, font=("Menlo", 10)).pack(side="left")
+        make_entry(self._m, 2).pack(side="left")
+        tk.Label(self, text=":", bg=BG, fg=FG2, font=("Menlo", 10)).pack(side="left")
+        make_entry(self._s, 2).pack(side="left")
+
+        self._h.trace_add("write", self._fire)
+        self._m.trace_add("write", self._fire)
+        self._s.trace_add("write", self._fire)
+
+    def _normalize(self, event=None):
+        try:
+            m = int(self._m.get())
+            s = int(self._s.get())
+            self._m.set(f"{m:02d}")
+            self._s.set(f"{s:02d}")
+        except:
+            pass
+
+    def _fire(self, *args):
+        if self._on_change:
+            self._on_change(self.get_ms())
+
+    def get_ms(self):
+        try:
+            h = int(self._h.get() or 0)
+            m = int(self._m.get() or 0)
+            s = int(self._s.get() or 0)
+            return hms_to_ms(h, m, s)
+        except:
+            return 0
+
+    def set_ms(self, ms):
+        h, m, s = ms_to_hms(ms)
+        self._h.set(str(h))
+        self._m.set(f"{m:02d}")
+        self._s.set(f"{s:02d}")
+
+
 class AutoClickerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("AutoClicker")
         self.root.geometry("460x820")
         self.root.resizable(False, False)
-
         self.root.configure(bg=BG)
         self.root.attributes("-topmost", False)
 
         self.automations = []
-
         self.sel_idx = None
-
         self.is_recording = False
-
         self.solo_running = False
         self.seq_running = False
-
         self.check_vars = {}
-
         self.is_paused = False
         self.in_loop_wait = False
-
         self.solo_in_cycle = False
 
         self.pause_event = threading.Event()
         self.pause_event.set()
-
         self.solo_done_event = threading.Event()
         self.solo_done_event.set()
 
@@ -578,32 +650,32 @@ class AutoClickerApp:
         )
         sf.pack(fill="x")
 
+        # 클릭 간격 (ms 유지)
         self._iv = tk.IntVar(value=auto.interval_ms)
         self._rv = tk.IntVar(value=auto.repeat_count)
-        self._cdv = tk.IntVar(value=auto.cycle_delay_ms)
-        self._ldv = tk.IntVar(value=auto.loop_delay_ms)
+        self._srow_ms(
+            sf, "클릭 간격 (ms)", self._iv, auto, "interval_ms", "액션 사이 간격"
+        )
+        self._srow_ms(
+            sf,
+            "반복 횟수 (0=무한)",
+            self._rv,
+            auto,
+            "repeat_count",
+            "액션 세트 반복 횟수",
+        )
 
-        for label, var, attr, hint in [
-            ("클릭 간격 (ms)", self._iv, "interval_ms", "액션 사이 간격"),
-            ("반복 횟수 (0=무한)", self._rv, "repeat_count", "액션 세트 반복 횟수"),
-            (
-                "사이클 간격 (ms)",
-                self._cdv,
-                "cycle_delay_ms",
-                "반복 1회 끝 → 다음 반복",
-            ),
-            (
-                "루프 간격 (ms)",
-                self._ldv,
-                "loop_delay_ms",
-                "전체 완료 → 재시작 (2.5h=9000000)",
-            ),
-        ]:
-            self._srow(sf, label, var, auto, attr, hint)
+        # 사이클 간격 (시:분:초)
+        self._srow_hms(
+            sf, "사이클 간격", auto, "cycle_delay_ms", "반복 1회 끝 → 다음 반복"
+        )
+
+        # 루프 간격 (시:분:초)
+        self._srow_hms(sf, "루프 간격", auto, "loop_delay_ms", "전체 완료 → 재시작")
 
         self.refresh_actions(auto)
 
-    def _srow(self, parent, label, var, auto, attr, hint=""):
+    def _srow_ms(self, parent, label, var, auto, attr, hint=""):
         row = tk.Frame(parent, bg=BG)
         row.pack(fill="x", padx=8, pady=3)
         left = tk.Frame(row, bg=BG)
@@ -637,6 +709,26 @@ class AutoClickerApp:
                 pass
 
         var.trace_add("write", on_change)
+
+    def _srow_hms(self, parent, label, auto, attr, hint=""):
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", padx=8, pady=3)
+        left = tk.Frame(row, bg=BG)
+        left.pack(side="left", fill="x", expand=True)
+        tk.Label(
+            left, text=label, font=("Helvetica Neue", 10), bg=BG, fg=FG, anchor="w"
+        ).pack(anchor="w")
+        hint_full = (hint + "  (시:분:초)") if hint else "(시:분:초)"
+        tk.Label(left, text=hint_full, font=("Helvetica Neue", 8), bg=BG, fg=FG2).pack(
+            anchor="w"
+        )
+
+        def on_change(ms):
+            setattr(auto, attr, ms)
+            self.save_config()
+
+        widget = HMSEntry(row, ms_value=getattr(auto, attr), on_change=on_change)
+        widget.pack(side="right", padx=(8, 0))
 
     def refresh_actions(self, auto=None):
         if auto is None:
@@ -892,7 +984,6 @@ class AutoClickerApp:
                         self.solo_status.set,
                     )
                     self._set_loop_wait(False)
-
             if loop_d > 0:
                 self._set_loop_wait(True)
                 self._wait_label(
@@ -990,8 +1081,6 @@ class AutoClickerApp:
 
         while not stop_check():
             loop_cnt += 1
-            total = repeat if repeat > 0 else "∞"
-
             for cycle in range(1, (repeat if repeat > 0 else 999999) + 1):
                 if stop_check():
                     break
