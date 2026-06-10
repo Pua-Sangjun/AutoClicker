@@ -141,16 +141,15 @@ class Automation:
 
 
 class HMSEntry(tk.Frame):
-    """시:분:초 입력 위젯"""
+    """시:분 입력 위젯"""
 
     def __init__(self, parent, ms_value=0, on_change=None, **kwargs):
         super().__init__(parent, bg=BG, **kwargs)
         self._on_change = on_change
 
-        h, m, s = ms_to_hms(ms_value)
+        h, m, _ = ms_to_hms(ms_value)
         self._h = tk.StringVar(value=str(h))
         self._m = tk.StringVar(value=f"{m:02d}")
-        self._s = tk.StringVar(value=f"{s:02d}")
 
         def make_entry(var, width=3):
             e = tk.Entry(
@@ -170,21 +169,17 @@ class HMSEntry(tk.Frame):
             return e
 
         make_entry(self._h, 3).pack(side="left")
-        tk.Label(self, text=":", bg=BG, fg=FG2, font=("Menlo", 10)).pack(side="left")
+        tk.Label(self, text="시", bg=BG, fg=FG2, font=("Menlo", 10)).pack(side="left")
         make_entry(self._m, 2).pack(side="left")
-        tk.Label(self, text=":", bg=BG, fg=FG2, font=("Menlo", 10)).pack(side="left")
-        make_entry(self._s, 2).pack(side="left")
+        tk.Label(self, text="분", bg=BG, fg=FG2, font=("Menlo", 10)).pack(side="left")
 
         self._h.trace_add("write", self._fire)
         self._m.trace_add("write", self._fire)
-        self._s.trace_add("write", self._fire)
 
     def _normalize(self, event=None):
         try:
             m = int(self._m.get())
-            s = int(self._s.get())
             self._m.set(f"{m:02d}")
-            self._s.set(f"{s:02d}")
         except:
             pass
 
@@ -196,16 +191,14 @@ class HMSEntry(tk.Frame):
         try:
             h = int(self._h.get() or 0)
             m = int(self._m.get() or 0)
-            s = int(self._s.get() or 0)
-            return hms_to_ms(h, m, s)
+            return hms_to_ms(h, m, 0)
         except:
             return 0
 
     def set_ms(self, ms):
-        h, m, s = ms_to_hms(ms)
+        h, m, _ = ms_to_hms(ms)
         self._h.set(str(h))
         self._m.set(f"{m:02d}")
-        self._s.set(f"{s:02d}")
 
 
 class AutoClickerApp:
@@ -239,20 +232,38 @@ class AutoClickerApp:
     # ── 단축키 ───────────────────────────────────────────
     def _bind_hotkeys(self):
         try:
-            from pynput import keyboard
+            from AppKit import NSEvent, NSKeyDownMask
+            import queue as q
 
-            def on_press(key):
+            key_queue = q.Queue()
+
+            def handler(event):
                 try:
-                    if key == keyboard.Key.f5:
-                        self.root.after(0, self.toggle_solo)
-                    elif key == keyboard.Key.f6:
-                        self.root.after(0, self.toggle_sequential)
+                    keycode = event.keyCode()
+                    if keycode in (96, 97):
+                        key_queue.put_nowait(keycode)
                 except:
                     pass
 
-            self._kb_listener = keyboard.Listener(on_press=on_press)
-            self._kb_listener.start()
-        except:
+            NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                NSKeyDownMask, handler
+            )
+
+            def poll_keys():
+                try:
+                    while True:
+                        keycode = key_queue.get_nowait()
+                        if keycode == 96:
+                            self.toggle_solo()
+                        elif keycode == 97:
+                            self.toggle_sequential()
+                except:
+                    pass
+                self.root.after(100, poll_keys)
+
+            self.root.after(100, poll_keys)
+
+        except Exception:
             self.root.bind("<F5>", lambda e: self.toggle_solo())
             self.root.bind("<F6>", lambda e: self.toggle_sequential())
 
@@ -448,6 +459,7 @@ class AutoClickerApp:
         for i, auto in enumerate(self.automations):
             var = tk.BooleanVar(value=old.get(i, False))
             self.check_vars[i] = var
+            var.trace_add("write", lambda *args: self._update_start_menu())
             is_sel = i == self.sel_idx
             row_bg = BLUE if is_sel else CARD
             row = tk.Frame(self.list_frame, bg=row_bg, cursor="hand2")
@@ -650,12 +662,12 @@ class AutoClickerApp:
         )
         sf.pack(fill="x")
 
-        # 클릭 간격 (ms 유지)
+        # 클릭 간격
         self._iv = tk.IntVar(value=auto.interval_ms)
         self._rv = tk.IntVar(value=auto.repeat_count)
-        self._srow_ms(
-            sf, "클릭 간격 (ms)", self._iv, auto, "interval_ms", "액션 사이 간격"
-        )
+        self._cdv = tk.IntVar(value=auto.cycle_delay_ms)
+
+        self._srow_ms(sf, "클릭 간격", self._iv, auto, "interval_ms", "액션 사이 간격")
         self._srow_ms(
             sf,
             "반복 횟수 (0=무한)",
@@ -665,12 +677,17 @@ class AutoClickerApp:
             "액션 세트 반복 횟수",
         )
 
-        # 사이클 간격 (시:분:초)
-        self._srow_hms(
-            sf, "사이클 간격", auto, "cycle_delay_ms", "반복 1회 끝 → 다음 반복"
+        # 사이클 간격
+        self._srow_ms(
+            sf,
+            "사이클 간격",
+            self._cdv,
+            auto,
+            "cycle_delay_ms",
+            "반복 1회 끝 → 다음 반복",
         )
 
-        # 루프 간격 (시:분:초)
+        # 루프 간격
         self._srow_hms(sf, "루프 간격", auto, "loop_delay_ms", "전체 완료 → 재시작")
 
         self.refresh_actions(auto)
@@ -718,10 +735,10 @@ class AutoClickerApp:
         tk.Label(
             left, text=label, font=("Helvetica Neue", 10), bg=BG, fg=FG, anchor="w"
         ).pack(anchor="w")
-        hint_full = (hint + "  (시:분:초)") if hint else "(시:분:초)"
-        tk.Label(left, text=hint_full, font=("Helvetica Neue", 8), bg=BG, fg=FG2).pack(
-            anchor="w"
-        )
+        if hint:
+            tk.Label(left, text=hint, font=("Helvetica Neue", 8), bg=BG, fg=FG2).pack(
+                anchor="w"
+            )
 
         def on_change(ms):
             setattr(auto, attr, ms)
