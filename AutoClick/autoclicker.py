@@ -37,22 +37,23 @@ def click_worker():
         item = click_queue.get()
         if item is None:
             break
-        action = item
-        if action["type"] == "click":
-            pyautogui.click(action["x"], action["y"])
-        elif action["type"] == "type":
-            pyautogui.typewrite(action["text"], interval=0.05)
-        elif action["type"] == "image":
-            try:
+        try:
+            action = item
+            if action["type"] == "click":
+                pyautogui.click(action["x"], action["y"])
+            elif action["type"] == "type":
+                pyautogui.typewrite(action["text"], interval=0.05)
+            elif action["type"] == "image":
                 loc = pyautogui.locateOnScreen(
                     action["image_path"], confidence=action.get("confidence", 0.8)
                 )
                 if loc:
                     center = pyautogui.center(loc)
                     pyautogui.click(center.x // 2, center.y // 2)
-            except Exception:
-                pass
-        click_queue.task_done()
+        except Exception:
+            pass
+        finally:
+            click_queue.task_done()
 
 
 threading.Thread(target=click_worker, daemon=True).start()
@@ -204,7 +205,7 @@ class HMSEntry(tk.Frame):
 class AutoClickerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AutoClicker")
+        self.root.title("AutoClicker v6")
         self.root.geometry("460x820")
         self.root.resizable(False, False)
         self.root.configure(bg=BG)
@@ -218,7 +219,11 @@ class AutoClickerApp:
         self.check_vars = {}
         self.is_paused = False
         self.in_loop_wait = False
-        self.solo_in_cycle = False
+        self._loop_wait_count = 0
+        self._loop_wait_guard = threading.Lock()
+
+        # 클릭 실행은 한 번에 하나만 (단독/순서 겹치면 대기열처럼 순번 대기)
+        self.click_lock = threading.Lock()
 
         self.pause_event = threading.Event()
         self.pause_event.set()
@@ -853,8 +858,16 @@ class AutoClickerApp:
             )
 
     def _set_loop_wait(self, state: bool):
-        self.in_loop_wait = state
-        if state:
+        # 단독/순서 대기가 동시에 있어도 한쪽이 끝나도 다른 쪽 일시정지는 유지
+        with self._loop_wait_guard:
+            if state:
+                self._loop_wait_count += 1
+            else:
+                self._loop_wait_count = max(0, self._loop_wait_count - 1)
+            active = self._loop_wait_count > 0
+            self.in_loop_wait = active
+
+        if active:
             self.root.after(0, lambda: self.pause_btn.config(state="normal"))
         else:
             self.is_paused = False
@@ -868,6 +881,20 @@ class AutoClickerApp:
                     state="disabled",
                 ),
             )
+
+    def _acquire_click_turn(self, stop_check, status_fn, waiting_msg):
+        """다른 쪽이 클릭 중이면 끝날 때까지 대기. 성공 시 True."""
+        while not stop_check():
+            if self.click_lock.acquire(timeout=0.5):
+                return True
+            self.root.after(0, status_fn, waiting_msg)
+        return False
+
+    def _release_click_turn(self):
+        try:
+            self.click_lock.release()
+        except RuntimeError:
+            pass
 
     def toggle_recording(self):
         if not self.is_recording:
@@ -968,50 +995,58 @@ class AutoClickerApp:
         def solo_stop_check():
             return not self.solo_running
 
-        interval = auto.interval_ms / 1000.0
-        repeat = auto.repeat_count
-        cycle_d = auto.cycle_delay_ms / 1000.0
-        loop_d = auto.loop_delay_ms / 1000.0
-
+        # 의도한 흐름: [클릭 실행] → [루프 대기 1회] → [클릭 실행] → ...
         while not solo_stop_check():
-            for cycle in range(1, (repeat if repeat > 0 else 999999) + 1):
-                if solo_stop_check():
-                    break
-                self.solo_in_cycle = True  # 사이클 시작
-                for i, action in enumerate(auto.actions):
+            interval = auto.interval_ms / 1000.0
+            repeat = auto.repeat_count
+            cycle_d = auto.cycle_delay_ms / 1000.0
+            loop_d = auto.loop_delay_ms / 1000.0
+            total_cycles = repeat if repeat > 0 else 999999
+
+            # 1) 클릭 실행 — 순서 실행과 겹치면 순번 대기
+            if not self._acquire_click_turn(
+                solo_stop_check,
+                self.solo_status.set,
+                f"🟢 단독: [{auto.name}] 순서 클릭 끝날 때까지 대기 중...",
+            ):
+                break
+            try:
+                for cycle in range(1, total_cycles + 1):
                     if solo_stop_check():
                         break
-                    click_queue.put(action)
-                    if i < len(auto.actions) - 1:
-                        time.sleep(interval)
-                if solo_stop_check():
-                    break
-                if not (repeat > 0 and cycle >= repeat) and cycle_d > 0:
-                    self._wait(cycle_d, solo_stop_check)
+                    n = len(auto.actions)
+                    for i, action in enumerate(auto.actions):
+                        if solo_stop_check():
+                            break
+                        self.root.after(
+                            0,
+                            self.solo_status.set,
+                            f"🟢 단독: [{auto.name}] 클릭 중 {i + 1}/{n}",
+                        )
+                        click_queue.put(action)
+                        if i < n - 1:
+                            time.sleep(interval)
+                    if solo_stop_check():
+                        break
+                    if not (repeat > 0 and cycle >= repeat) and cycle_d > 0:
+                        self._wait(cycle_d, solo_stop_check)
+            finally:
+                self._release_click_turn()
+
             if solo_stop_check():
                 break
-            self.solo_in_cycle = False  # 루프 대기 시작
-            if repeat > 0:
-                if loop_d > 0:
-                    self._set_loop_wait(True)
-                    self._wait_label(
-                        loop_d,
-                        f"⏳  [{auto.name}]  루프 대기",
-                        solo_stop_check,
-                        self.solo_status.set,
-                    )
-                    self._set_loop_wait(False)
+
+            # 2) 루프 대기는 락 없이 (다른 쪽이 그동안 클릭 가능)
             if loop_d > 0:
                 self._set_loop_wait(True)
                 self._wait_label(
                     loop_d,
-                    f"⏳  [{auto.name}]  다음 루프",
+                    f"⏳  [{auto.name}]  루프 대기",
                     solo_stop_check,
                     self.solo_status.set,
                 )
                 self._set_loop_wait(False)
 
-        self.solo_in_cycle = False
         self.solo_running = False
         self.solo_done_event.set()
         self.root.after(
@@ -1060,13 +1095,6 @@ class AutoClickerApp:
             for idx, auto in enumerate(autos):
                 if not self.seq_running:
                     break
-                while self.solo_in_cycle and self.seq_running:
-                    self.root.after(
-                        0, self.seq_status.set, "🔵 단독 실행 완료 대기 중..."
-                    )
-                    time.sleep(0.5)
-                if not self.seq_running:
-                    break
                 self.root.after(
                     0,
                     self.seq_status.set,
@@ -1090,31 +1118,46 @@ class AutoClickerApp:
 
     # ── 공통 실행 ────────────────────────────────────────
     def _run_one(self, auto, stop_check, status_fn):
-        interval = auto.interval_ms / 1000.0
-        repeat = auto.repeat_count
-        cycle_d = auto.cycle_delay_ms / 1000.0
-        loop_d = auto.loop_delay_ms / 1000.0
-        loop_cnt = 0
-
         while not stop_check():
-            loop_cnt += 1
-            for cycle in range(1, (repeat if repeat > 0 else 999999) + 1):
-                if stop_check():
-                    break
-                for i, action in enumerate(auto.actions):
+            interval = auto.interval_ms / 1000.0
+            repeat = auto.repeat_count
+            cycle_d = auto.cycle_delay_ms / 1000.0
+            loop_d = auto.loop_delay_ms / 1000.0
+
+            # 클릭 구간만 단독과 상호 배타 (루프 대기는 락 없음)
+            if not self._acquire_click_turn(
+                stop_check,
+                status_fn,
+                f"🔵 순서: [{auto.name}] 단독 클릭 끝날 때까지 대기 중...",
+            ):
+                break
+            try:
+                for cycle in range(1, (repeat if repeat > 0 else 999999) + 1):
                     if stop_check():
                         break
-                    click_queue.put(action)
-                    if i < len(auto.actions) - 1:
-                        time.sleep(interval)
-                if stop_check():
-                    break
-                if not (repeat > 0 and cycle >= repeat) and cycle_d > 0:
-                    self._wait(cycle_d, stop_check)
+                    n = len(auto.actions)
+                    for i, action in enumerate(auto.actions):
+                        if stop_check():
+                            break
+                        self.root.after(
+                            0,
+                            status_fn,
+                            f"🔵 순서: [{auto.name}] 클릭 중 {i + 1}/{n}",
+                        )
+                        click_queue.put(action)
+                        if i < n - 1:
+                            time.sleep(interval)
+                    if stop_check():
+                        break
+                    if not (repeat > 0 and cycle >= repeat) and cycle_d > 0:
+                        self._wait(cycle_d, stop_check)
+            finally:
+                self._release_click_turn()
 
             if stop_check():
                 break
 
+            # 순서 실행: 반복 횟수가 있으면 한 번 돌리고 다음 자동화로 넘어감
             if repeat > 0:
                 if loop_d > 0:
                     self._set_loop_wait(True)
@@ -1124,10 +1167,11 @@ class AutoClickerApp:
                     self._set_loop_wait(False)
                 break
 
+            # 반복 횟수 0(무한): 루프 대기 1회 후 같은 자동화 재실행
             if loop_d > 0:
                 self._set_loop_wait(True)
                 self._wait_label(
-                    loop_d, f"⏳  [{auto.name}]  다음 루프", stop_check, status_fn
+                    loop_d, f"⏳  [{auto.name}]  루프 대기", stop_check, status_fn
                 )
                 self._set_loop_wait(False)
 
